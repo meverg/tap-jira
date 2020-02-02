@@ -1,10 +1,16 @@
 #!/usr/bin/env python3
-import os
+import argparse
 import json
+import os
+
+import boto3
 import singer
-from singer import utils
+from google.api_core.exceptions import NotFound
+from google.cloud import storage
 from singer import metadata
+from singer import utils
 from singer.catalog import Catalog, CatalogEntry, Schema
+
 from . import streams as streams_
 from .context import Context
 from .http import Client
@@ -16,12 +22,86 @@ REQUIRED_CONFIG_KEYS_CLOUD = ["start_date",
                               "access_token",
                               "refresh_token",
                               "oauth_client_id",
-                              "oauth_client_secret"]
+                              "oauth_client_secret",
+                              "gcs_state_bucket",
+                              "gcs_state_blob"]
 REQUIRED_CONFIG_KEYS_HOSTED = ["start_date",
                                "username",
                                "password",
                                "base_url",
                                "user_agent"]
+
+
+def parse_args(required_config_keys):
+    '''Parse standard command-line args.
+
+    Parses the command-line arguments mentioned in the SPEC and the
+    BEST_PRACTICES documents:
+
+    -c,--config     Config file
+    -s,--state      State file
+    -d,--discover   Run in discover mode
+    -p,--properties Properties file: DEPRECATED, please use --catalog instead
+    --catalog       Catalog file
+
+    Returns the parsed args object from argparse. For each argument that
+    point to JSON files (config, state, properties), we will automatically
+    load and parse the JSON file.
+    '''
+    parser = argparse.ArgumentParser()
+
+    parser.add_argument(
+        '-c', '--config',
+        help='Config file',
+        required=True)
+
+    parser.add_argument(
+        '-s', '--state',
+        help='State file')
+
+    parser.add_argument(
+        '-p', '--properties',
+        help='Property selections: DEPRECATED, Please use --catalog instead')
+
+    parser.add_argument(
+        '--catalog',
+        help='Catalog file')
+
+    parser.add_argument(
+        '-d', '--discover',
+        action='store_true',
+        help='Do schema discovery')
+
+    parser.add_argument(
+        '-e', '--env',
+        help='Environment')
+
+    args = parser.parse_args()
+    if args.config:
+        args.config = utils.load_json(args.config)
+    if args.state:
+        args.state = utils.load_json(args.state)
+    else:
+        args.state = {}
+    if args.properties:
+        args.properties = utils.load_json(args.properties)
+    if args.catalog:
+        args.catalog = Catalog.load(args.catalog)
+
+    utils.check_config(args.config, required_config_keys)
+
+    return args
+
+
+def get_param(key):
+    ssm = boto3.client('ssm', region_name='eu-west-1')
+    parameter = ssm.get_parameter(Name=key, WithDecryption=True)
+    return parameter['Parameter']['Value']
+
+
+def get_with_aws(value, env):
+    if value.startswith("aws"):
+        return get_param(f'/{env}/{value}')
 
 
 def get_args():
@@ -82,7 +162,6 @@ def output_schema(stream):
 def sync():
     streams_.validate_dependencies()
 
-
     # two loops through streams are necessary so that the schema is output
     # BEFORE syncing any streams. Otherwise, the first stream might generate
     # data for the second stream, but the second stream hasn't output its
@@ -111,8 +190,22 @@ def main_impl():
     # Setup Context
     catalog = Catalog.from_dict(args.properties) \
         if args.properties else discover()
-    Context.config = args.config
-    Context.state = args.state
+    Context.config = {k: get_with_aws(v, args.env) for k, v in args.config.items()}
+
+    bucket_name = Context.config.get("gcs_state_bucket")
+    blob_name = Context.config.get("gcs_state_blob")
+
+    if blob_name and bucket_name:
+        storage_client = storage.Client()
+        bucket = storage_client.bucket(bucket_name)
+        blob = bucket.blob(blob_name)
+        try:
+            Context.state = json.loads(blob.download_as_string())
+        except NotFound:
+            Context.state = args.state
+    else:
+        Context.state = args.state
+
     Context.catalog = catalog
 
     Context.client = Client(Context.config)
@@ -127,12 +220,14 @@ def main_impl():
         if Context.client and Context.client.login_timer:
             Context.client.login_timer.cancel()
 
+
 def main():
     try:
         main_impl()
     except Exception as exc:
         LOGGER.critical(exc)
         raise exc
+
 
 if __name__ == "__main__":
     main()

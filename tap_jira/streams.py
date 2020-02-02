@@ -1,5 +1,4 @@
 import json
-import pytz
 import requests
 import singer
 
@@ -51,24 +50,31 @@ def raise_if_bookmark_cannot_advance(worklogs):
                         .format(worklog_updatedes[0]))
 
 
-def sync_sub_streams(page):
+def filter_sub_stream_by_date(records, filter_on, updated_bookmark):
+    last_updated = Context.update_start_date_bookmark(updated_bookmark)
+    filtered_records = [r for r in records if utils.strptime_to_utc(r[filter_on]) > last_updated]
+    filtered_records.sort(key=lambda r: r[filter_on])
+    return filtered_records
+
+
+def sync_sub_streams(page, comments_, changelogs_, transitions_):
     for issue in page:
         comments = issue["fields"].pop("comment")["comments"]
         if comments and Context.is_selected(ISSUE_COMMENTS.tap_stream_id):
             for comment in comments:
                 comment["issueId"] = issue["id"]
-            ISSUE_COMMENTS.write_page(comments)
+            comments_ = comments_ + comments
         changelogs = issue.pop("changelog")["histories"]
         if changelogs and Context.is_selected(CHANGELOGS.tap_stream_id):
             for changelog in changelogs:
                 changelog["issueId"] = issue["id"]
-            CHANGELOGS.write_page(changelogs)
+            changelogs_ = changelogs_ + changelogs
         transitions = issue.pop("transitions")
         if transitions and Context.is_selected(ISSUE_TRANSITIONS.tap_stream_id):
             for transition in transitions:
                 transition["issueId"] = issue["id"]
-            ISSUE_TRANSITIONS.write_page(transitions)
-
+            transitions_ = transitions_ + transitions
+    return comments_, changelogs_, transitions_
 
 def advance_bookmark(worklogs):
     raise_if_bookmark_cannot_advance(worklogs)
@@ -178,14 +184,15 @@ class Users(Stream):
 class Issues(Stream):
 
     def sync(self):
+        comments = changelogs = transitions = []
+
         updated_bookmark = [self.tap_stream_id, "updated"]
         page_num_offset = [self.tap_stream_id, "offset", "page_num"]
 
         last_updated = Context.update_start_date_bookmark(updated_bookmark)
-        timezone = Context.retrieve_timezone()
-        start_date = last_updated.astimezone(pytz.timezone(timezone)).strftime("%Y-%m-%d %H:%M")
+        start_date = int(last_updated.timestamp() * 1000)
 
-        jql = "updated >= '{}' order by updated asc".format(start_date)
+        jql = "updated > {} order by updated asc".format(start_date)
         params = {"fields": "*all",
                   "expand": "changelog,transitions",
                   "validateQuery": "strict",
@@ -195,8 +202,8 @@ class Issues(Stream):
         for page in pager.pages(self.tap_stream_id,
                                 "GET", "/rest/api/2/search",
                                 params=params):
-            # sync comments and changelogs for each issue
-            sync_sub_streams(page)
+            # sync comments and changelogs at the end
+            comments, changelogs, transitions = sync_sub_streams(page, comments, changelogs, transitions)
             for issue in page:
                 issue['fields'].pop('worklog', None)
                 # The JSON schema for the search endpoint indicates an "operations"
@@ -216,6 +223,21 @@ class Issues(Stream):
 
             Context.set_bookmark(page_num_offset, pager.next_page_num)
             singer.write_state(Context.state)
+
+        # write sub streams
+        if comments:
+            comments_updated_bookmark = [ISSUE_COMMENTS.tap_stream_id, "updated"]
+            filtered_comments = filter_sub_stream_by_date(comments, "updated", comments_updated_bookmark)
+            ISSUE_COMMENTS.write_page(filtered_comments)
+            Context.set_bookmark(comments_updated_bookmark, filtered_comments[-1]["updated"])
+        if changelogs:
+            changelogs_updated_bookmark = [CHANGELOGS.tap_stream_id, "updated"]
+            filtered_changelogs = filter_sub_stream_by_date(changelogs, "created", changelogs_updated_bookmark)
+            CHANGELOGS.write_page(filtered_changelogs)
+            Context.set_bookmark(changelogs_updated_bookmark, filtered_changelogs[-1]["created"])
+        if transitions:
+            ISSUE_TRANSITIONS.write_page(transitions)
+
         Context.set_bookmark(page_num_offset, None)
         Context.set_bookmark(updated_bookmark, last_updated)
         singer.write_state(Context.state)
@@ -224,7 +246,8 @@ class Issues(Stream):
 class Worklogs(Stream):
     def _fetch_ids(self, last_updated):
         # since_ts uses millisecond precision
-        since_ts = int(last_updated.timestamp()) * 1000
+        # add 100 miliseconds to skip the last record again
+        since_ts = int(last_updated.timestamp() + 100) * 1000
         return Context.client.request(
             self.tap_stream_id,
             "GET",

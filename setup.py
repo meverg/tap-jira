@@ -11,6 +11,8 @@ setup(name="tap-jira",
       install_requires=[
           "singer-python==5.4.1",
           "requests==2.20.0",
+          "boto3",
+          "google-cloud-storage"
       ],
       extras_require={
           'dev': [

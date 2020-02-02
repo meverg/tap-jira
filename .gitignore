@@ -103,4 +103,6 @@ singer-check-tap-data
 state.json
 catalog.json
 
+.idea/
+
 todo.org
